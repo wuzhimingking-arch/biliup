@@ -35,6 +35,7 @@ const Cookie: React.FC<Props> = props => {
         />
         <Form.Input
           field="user.niconico-email"
+          autoComplete="off"
           extraText="与您的 Niconico 账户相关联的电子邮件或电话号码。"
           label="ニコニコ動画 用户名（niconico-email）"
           style={{ width: '100%' }}
@@ -45,6 +46,7 @@ const Cookie: React.FC<Props> = props => {
         />
         <Form.Input
           field="user.niconico-password"
+          autoComplete="new-password"
           mode="password"
           extraText="您的 Niconico 账户的密码。"
           label="ニコニコ動画 密码（niconico-password）"
@@ -56,6 +58,7 @@ const Cookie: React.FC<Props> = props => {
         />
         <Form.Input
           field="user.niconico-user-session"
+          autoComplete="new-password"
           extraText="用户会话令牌的值，可作为提供密码的替代方法。"
           label="ニコニコ動画 用户会话令牌（niconico-user-session）"
           mode="password"
@@ -77,6 +80,7 @@ const Cookie: React.FC<Props> = props => {
         />
         <Form.Input
           field="user.afreecatv_username"
+          autoComplete="off"
           extraText="您的 AfreecaTV 用户名。"
           label="AfreecaTV 用户名（afreecatv_username）"
           style={{ width: '100%' }}
@@ -87,6 +91,7 @@ const Cookie: React.FC<Props> = props => {
         />
         <Form.Input
           field="user.afreecatv_password"
+          autoComplete="new-password"
           extraText="您的 AfreecaTV 密码。"
           label="AfreecaTV 密码（afreecatv_password）"
           mode="password"

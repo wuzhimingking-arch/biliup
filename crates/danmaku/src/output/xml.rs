@@ -281,6 +281,11 @@ impl XmlWriter {
     /// Flush the writer to disk.
     pub fn flush(&mut self) -> Result<()> {
         self.writer.get_mut().flush()?;
+        tracing::debug!(
+            records = self.message_count,
+            finalized = self.finalized,
+            "XML flush completed"
+        );
         Ok(())
     }
 

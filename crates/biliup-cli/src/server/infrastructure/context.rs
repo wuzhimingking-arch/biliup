@@ -167,11 +167,16 @@ impl Worker {
     /// * `config` - 全局配置的Arc引用
     /// * `client` - HTTP客户端
     pub fn new(
-        live_streamer: LiveStreamer,
-        upload_streamer: Option<UploadStreamer>,
+        mut live_streamer: LiveStreamer,
+        mut upload_streamer: Option<UploadStreamer>,
         config: Arc<RwLock<Config>>,
         client: StatelessClient,
     ) -> Self {
+        if std::env::var("BILIUP_LOCAL_DANMAKU_TEST").as_deref() == Ok("1") {
+            local_test_record_only(&mut live_streamer);
+            upload_streamer = None;
+            info!("Local danmaku test: automatic upload and all recording hooks disabled");
+        }
         Self {
             downloader_status: RwLock::new(Default::default()),
             uploader_status: Default::default(),
@@ -217,6 +222,14 @@ impl Worker {
         if let Some(cfg_p) = self.live_streamer.override_cfg.clone() {
             cfg.apply(cfg_p)
         }
+        if std::env::var("BILIUP_LOCAL_DANMAKU_TEST").as_deref() == Ok("1") {
+            cfg.uploader = Some("Noop".into());
+            cfg.downloader = Some(crate::server::core::downloader::DownloaderType::Mesio);
+            cfg.bilibili_danmaku = Some(true);
+            cfg.filtering_threshold = 0;
+            cfg.filename_prefix
+                .get_or_insert_with(|| "recordings/{streamer}_%Y%m%d_%H%M%S".into());
+        }
         cfg
     }
 
@@ -250,6 +263,15 @@ impl Worker {
             }
         }
     }
+}
+
+// 本地隔离测试即使表单带默认 rm，也不能执行任何录制钩子。
+fn local_test_record_only(streamer: &mut LiveStreamer) {
+    streamer.upload_streamers_id = None;
+    streamer.preprocessor = None;
+    streamer.segment_processor = None;
+    streamer.downloaded_processor = None;
+    streamer.postprocessor = None;
 }
 
 pub fn find_worker(workers: &[Arc<Worker>], id: i64) -> Option<&Arc<Worker>> {
@@ -332,6 +354,54 @@ mod tests {
             opt_args: None,
             excluded_keywords: None,
         }
+    }
+
+    #[test]
+    fn local_test_removes_upload_link_and_all_hooks() {
+        let mut streamer = streamer_with_override(None);
+        streamer.upload_streamers_id = Some(5);
+        let hooks = serde_json::from_str(r#"["rm"]"#).unwrap();
+        streamer.postprocessor = Some(hooks);
+        local_test_record_only(&mut streamer);
+        assert!(streamer.upload_streamers_id.is_none());
+        assert!(streamer.preprocessor.is_none());
+        assert!(streamer.segment_processor.is_none());
+        assert!(streamer.downloaded_processor.is_none());
+        assert!(streamer.postprocessor.is_none());
+    }
+
+    #[test]
+    fn formal_mode_keeps_upload_config_and_recording_hooks() {
+        assert_ne!(
+            std::env::var("BILIUP_LOCAL_DANMAKU_TEST").as_deref(),
+            Ok("1")
+        );
+        let mut streamer = streamer_with_override(None);
+        streamer.upload_streamers_id = Some(5);
+        let hooks = serde_json::from_str(r#"["fixture-command"]"#).unwrap();
+        streamer.segment_processor = Some(hooks);
+        let original = serde_json::to_value(&streamer).unwrap();
+        let upload = serde_json::from_str(
+            r#"{"id":5,"template_name":"fixture","tags":[],"uploader":"biliup-rs"}"#,
+        )
+        .unwrap();
+        let worker = Worker::new(
+            streamer,
+            Some(upload),
+            Arc::new(RwLock::new(Config {
+                uploader: Some("biliup-rs".into()),
+                filtering_threshold: 123,
+                ..Config::default()
+            })),
+            StatelessClient::default(),
+        );
+        assert_eq!(
+            serde_json::to_value(worker.get_streamer()).unwrap(),
+            original
+        );
+        assert_eq!(worker.get_upload_config().as_ref().unwrap().id, 5);
+        assert_eq!(worker.get_config().uploader.as_deref(), Some("biliup-rs"));
+        assert_eq!(worker.get_config().filtering_threshold, 123);
     }
 
     /// 复现：全局 file_size=100MB，主播覆写只选了 sync-downloader，

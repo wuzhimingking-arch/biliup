@@ -3,6 +3,10 @@
 //! The [`DanmakuRecorder`] manages WebSocket connections, heartbeats,
 //! message processing, and XML output for recording live stream chat.
 
+#[cfg(test)]
+#[path = "client_diagnostics_tests.rs"]
+mod diagnostics_tests;
+
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -35,15 +39,17 @@ fn decode_message_guarded(
     data: &[u8],
     platform_name: &str,
 ) -> Result<DecodeResult> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| platform.decode_message(data)))
-        .unwrap_or_else(|_| {
-            error!(
-                "{}: decoder panicked on a {}-byte message, skipping it",
-                platform_name,
-                data.len()
-            );
-            Err(DanmakuError::Decode("decoder panicked".to_string()))
-        })
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        platform.decode_message(data)
+    }))
+    .unwrap_or_else(|_| {
+        error!(
+            "{}: decoder panicked on a {}-byte message, skipping it",
+            platform_name,
+            data.len()
+        );
+        Err(DanmakuError::Decode("decoder panicked".to_string()))
+    })
 }
 
 /// Configuration for the danmaku recorder.
@@ -265,7 +271,9 @@ impl DanmakuRecorder {
 
         // Finish XML file
         let has_messages = xml_writer.has_messages();
+        let records = xml_writer.message_count();
         let final_path = xml_writer.finish()?;
+        info!(records, "XML recording finalized");
         if !has_messages {
             let _ = fs::remove_file(&final_path);
         }
@@ -347,6 +355,38 @@ impl DanmakuRecorder {
 
         match conn_info.transport {
             ConnectionTransport::WebSocket => {
+                if conn_info.auth_timeout.is_some() {
+                    let urls = std::iter::once(conn_info.ws_url.clone())
+                        .chain(conn_info.fallback_ws_urls.iter().cloned());
+                    let mut last_error = DanmakuError::ConnectionClosed;
+                    for url in urls {
+                        if *stop_rx.borrow() {
+                            return Err(DanmakuError::Stopped);
+                        }
+                        let mut node = conn_info.clone();
+                        node.ws_url = url;
+                        node.fallback_ws_urls.clear();
+                        match self
+                            .run_websocket_connection(
+                                node,
+                                cmd_rx,
+                                stop_rx,
+                                xml_writer,
+                                xml_config,
+                                platform_name,
+                            )
+                            .await
+                        {
+                            Ok(()) => return Ok(()),
+                            Err(DanmakuError::Stopped) => return Err(DanmakuError::Stopped),
+                            Err(e) => {
+                                warn!(error = %e, "Bilibili node failed; trying next advertised node");
+                                last_error = e;
+                            }
+                        }
+                    }
+                    return Err(last_error);
+                }
                 self.run_websocket_connection(
                     conn_info,
                     cmd_rx,
@@ -383,7 +423,18 @@ impl DanmakuRecorder {
         debug!("{}: Connecting to {}", platform_name, conn_info.ws_url);
 
         // Connect
-        let ws_stream = connect_websocket(&conn_info, platform_name).await?;
+        let ws_stream = if let Some(timeout) = conn_info.auth_timeout {
+            tokio::time::timeout(timeout, connect_websocket(&conn_info, platform_name))
+                .await
+                .map_err(|_| {
+                    DanmakuError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "WebSocket handshake timed out",
+                    ))
+                })??
+        } else {
+            connect_websocket(&conn_info, platform_name).await?
+        };
         let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
         info!("{}: Connected to WebSocket", platform_name);
@@ -396,34 +447,23 @@ impl DanmakuRecorder {
             };
             ws_sink.send(msg).await?;
         }
+        debug!(
+            packets = conn_info.registration_data.len(),
+            "Registration packets sent (payload redacted)"
+        );
 
         // Get heartbeat config
         let heartbeat_config = self.platform.heartbeat_config();
 
-        // Create heartbeat receiver
-        let mut heartbeat_rx = if let Some(ref hb_data) = heartbeat_config.data {
-            let hb_data = hb_data.clone();
-            let interval_duration = heartbeat_config.interval;
-            let (hb_tx, hb_rx) = mpsc::channel::<Message>(1);
-
-            tokio::spawn(async move {
-                let mut ticker = interval(interval_duration);
-                loop {
-                    ticker.tick().await;
-                    let msg = match &hb_data {
-                        HeartbeatData::Text(text) => Message::Text(text.clone().into()),
-                        HeartbeatData::Binary(data) => Message::Binary(data.clone().into()),
-                    };
-                    if hb_tx.send(msg).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            Some(hb_rx)
-        } else {
-            None
-        };
+        let mut authenticated = conn_info.auth_timeout.is_none();
+        let auth_deadline =
+            tokio::time::sleep(conn_info.auth_timeout.unwrap_or(Duration::from_secs(10)));
+        tokio::pin!(auth_deadline);
+        let mut heartbeat = interval(heartbeat_config.interval);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut frames = 0u64;
+        let mut packets = 0usize;
+        let mut events = 0usize;
 
         // Main message loop
         loop {
@@ -431,25 +471,32 @@ impl DanmakuRecorder {
                 // Check stop signal
                 _ = stop_rx.changed() => {
                     if *stop_rx.borrow() {
+                        info!(frames, packets, events, records = xml_writer.message_count(), "WebSocket local stop");
+                        let _ = ws_sink.close().await;
                         return Err(DanmakuError::Stopped);
                     }
                 }
 
                 // Handle heartbeat
-                hb_msg = async {
-                    match heartbeat_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => futures::future::pending().await,
-                    }
-                } => {
-                    if let Some(msg) = hb_msg {
-                        ws_sink.send(msg).await?;
-                    }
+                _ = &mut auth_deadline, if !authenticated => {
+                    warn!(frames, packets, "Bilibili authentication response timed out");
+                    return Err(DanmakuError::AuthenticationTimeout);
+                }
+
+                _ = heartbeat.tick(), if authenticated && heartbeat_config.data.is_some() => {
+                    let msg = match heartbeat_config.data.as_ref().unwrap() {
+                        HeartbeatData::Text(text) => Message::Text(text.clone().into()),
+                        HeartbeatData::Binary(data) => Message::Binary(data.clone().into()),
+                    };
+                    ws_sink.send(msg).await?;
+                    debug!("{}: Application heartbeat sent", platform_name);
                 }
 
                 // Handle recorder commands
                 Some(command) = cmd_rx.recv() => {
                     if handle_command(command, &self.config.output_file, xml_writer, xml_config)? {
+                        info!(frames, packets, events, records = xml_writer.message_count(), "WebSocket local command stop");
+                        let _ = ws_sink.close().await;
                         return Err(DanmakuError::Stopped);
                     }
                 }
@@ -466,15 +513,28 @@ impl DanmakuRecorder {
                                     continue;
                                 }
                                 Message::Pong(_) => continue,
-                                Message::Close(_) => {
+                                Message::Close(frame) => {
+                                    warn!(close_code = ?frame.as_ref().map(|f| f.code), frames, packets, events, records = xml_writer.message_count(), "WebSocket server close");
                                     return Err(DanmakuError::ConnectionClosed);
                                 }
                                 _ => continue,
                             };
+                            frames += 1;
 
                             // Decode message
                             match decode_message_guarded(self.platform.as_ref(), &data, platform_name) {
                                 Ok(result) => {
+                                    packets += result.packet_count;
+                                    if let Some(code) = result.auth_code {
+                                        if code != 0 { return Err(DanmakuError::Authentication(code)); }
+                                        if !authenticated {
+                                            authenticated = true;
+                                            heartbeat.reset_immediately();
+                                            info!("Bilibili protocol authentication succeeded (code=0)");
+                                        }
+                                    }
+                                    if !authenticated { continue; }
+                                    events += result.events.len();
                                     // Write decoded events
                                     for event in result.events {
                                         self.emit_live(&event);
@@ -482,6 +542,7 @@ impl DanmakuRecorder {
                                             warn!("Failed to write event: {}", e);
                                         }
                                     }
+                                    debug!(frames, packets, events, records = xml_writer.message_count(), "Danmaku receive/write counters");
 
                                     // Send ack if needed
                                     if let Some(ack) = result.ack {
@@ -500,9 +561,11 @@ impl DanmakuRecorder {
                             }
                         }
                         Some(Err(e)) => {
+                            warn!(frames, packets, events, records = xml_writer.message_count(), error = %e, "WebSocket I/O or protocol error");
                             return Err(DanmakuError::WebSocket(e));
                         }
                         None => {
+                            warn!(frames, packets, events, "WebSocket server EOF");
                             return Err(DanmakuError::ConnectionClosed);
                         }
                     }

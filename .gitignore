@@ -52,6 +52,23 @@ cookies.json
 .augment/
 .cunzhi-memory/
 .serena/
+
+# Custom diagnostic outputs and local credentials never belong in the Fork.
+/local-test/.build/
+/local-test/runtime/
+/local-test/evidence/
+/local-test/collections/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.tar
+*.tar.gz
+*.bundle
+*.pem
+*.key
+.env.local
+.env.*.local
 .cargo/
 logs/
 CLAUDE.md

@@ -174,6 +174,7 @@ const { data: entity, error, isLoading, mutate } = useSWR('/v1/configuration', f
         ) : null}
         <Form
           key={formKey}
+          autoComplete="off"
           className={styles.form}
           initValues={entity}
           disabled={!editable}

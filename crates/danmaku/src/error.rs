@@ -8,6 +8,11 @@ pub type Result<T> = std::result::Result<T, DanmakuError>;
 /// Errors that can occur during danmaku recording.
 #[derive(Error, Debug)]
 pub enum DanmakuError {
+    #[error("Protocol authentication rejected (code={0})")]
+    Authentication(i64),
+
+    #[error("Protocol authentication response timed out")]
+    AuthenticationTimeout,
     /// The URL does not match any supported platform.
     #[error("Unsupported platform for URL: {0}")]
     UnsupportedPlatform(String),

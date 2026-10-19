@@ -1,0 +1,12 @@
+services:
+  biliup:
+    image: biliup-custom:danmaku
+    working_dir: /opt
+    command: [server, --bind, 0.0.0.0, --auth]
+    environment:
+      BILIUP_LOCAL_DANMAKU_TEST: "0"
+    ports:
+      - "127.0.0.1:${BILIUP_PORT:-19159}:19159"
+    volumes:
+      - "${BILIUP_DATA_DIR:?Set your existing data directory}:/opt"
+    restart: unless-stopped

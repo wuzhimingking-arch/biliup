@@ -23,3 +23,14 @@ cookies.json
 # 文档站与桌面端与镜像无关
 docs
 tauri-app
+
+# Local diagnostics must never be sent to the Docker builder.
+local-test/.build
+local-test/runtime
+local-test/evidence
+local-test/collections
+*.tar
+*.tar.gz
+*.bundle
+*.pem
+*.key

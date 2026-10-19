@@ -51,6 +51,8 @@ pub struct ConnectionInfo {
     pub registration_data: Vec<RegistrationData>,
     /// HTTP headers for the WebSocket connection.
     pub headers: HeaderMap,
+    /// Wait for protocol authentication before starting application heartbeats.
+    pub auth_timeout: Option<Duration>,
 }
 
 impl ConnectionInfo {
@@ -62,6 +64,7 @@ impl ConnectionInfo {
             transport: ConnectionTransport::WebSocket,
             registration_data: Vec::new(),
             headers: HeaderMap::new(),
+            auth_timeout: None,
         }
     }
 
@@ -137,6 +140,9 @@ pub enum HeartbeatData {
 /// Result of decoding a WebSocket message.
 #[derive(Debug, Default)]
 pub struct DecodeResult {
+    pub auth_code: Option<i64>,
+    pub packet_count: usize,
+    pub heartbeat_replies: usize,
     /// Decoded events.
     pub events: Vec<DanmakuEvent>,
     /// Optional acknowledgment packet to send back (e.g., for Douyin).
@@ -157,6 +163,7 @@ impl DecodeResult {
             events,
             ack: None,
             ack_is_text: false,
+            ..Self::default()
         }
     }
 

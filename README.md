@@ -1,3 +1,5 @@
+> 本分支为基于官方 v1.2.11 的 `1.2.11-danmaku.4` 弹幕修复定制版。修复内容、测试模式、历史验收及上游同步方法见 [定制说明](tools/danmaku/README.md)。保留官方历史与许可证；本 Fork 的 master 跟随官方，定制代码位于 peakedge/danmaku-fix。
+
 <div align="center">
   <img src="https://raw.githubusercontent.com/biliup/biliup/master/public/logo.png" alt="biliup" width="300" height="300"/>
 </div>

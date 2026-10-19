@@ -7,6 +7,10 @@
 //! - Version 3: brotli compressed payload
 //! - JSON messages for chat, gifts, super chat, etc.
 
+#[cfg(test)]
+#[path = "bilibili_diagnostics_tests.rs"]
+mod diagnostics_tests;
+
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::time::Duration;
@@ -34,9 +38,6 @@ use crate::protocols::{
 
 /// User agent for Bilibili requests.
 const USER_AGENT_STRING: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
-/// Default WebSocket URL.
-const DEFAULT_WS_URL: &str = "wss://broadcastlv.chat.bilibili.com/sub";
 
 /// Maximum nesting depth for compressed packets.
 /// The real protocol only nests one level (compressed packet contains raw packets);
@@ -114,6 +115,50 @@ impl Bilibili {
         Self { client, wbi_signer }
     }
 
+    fn auth_uid(context: &PlatformContext) -> Result<u64> {
+        let mut cookie_uid = None;
+        let mut has_session = false;
+        for part in context.cookie.as_deref().unwrap_or("").split(';') {
+            let Some((name, value)) = part.trim().split_once('=') else {
+                continue;
+            };
+            if name.trim() == "SESSDATA" && !value.trim().is_empty() {
+                has_session = true;
+            }
+            if name.trim() == "DedeUserID" {
+                let uid = value
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|uid| *uid > 0)
+                    .ok_or_else(|| {
+                        DanmakuError::Decode("Invalid Bilibili cookie UID (value redacted)".into())
+                    })?;
+                if cookie_uid.is_some_and(|previous| previous != uid) {
+                    return Err(DanmakuError::Decode(
+                        "Conflicting Bilibili cookie UIDs (values redacted)".into(),
+                    ));
+                }
+                cookie_uid = Some(uid);
+            }
+        }
+        if let (Some(explicit), Some(cookie)) = (context.uid, cookie_uid) {
+            if explicit != cookie {
+                return Err(DanmakuError::Decode(
+                    "Bilibili context UID does not match cookie UID (values redacted)".into(),
+                ));
+            }
+        }
+        // A logged-in API token cannot authenticate an anonymous uid=0 registration.
+        let uid = context.uid.or(cookie_uid).unwrap_or(0);
+        if has_session && uid == 0 {
+            return Err(DanmakuError::Decode(
+                "Bilibili session cookie requires its account UID (credentials redacted)".into(),
+            ));
+        }
+        Ok(uid)
+    }
+
     /// Build default headers for requests.
     fn default_headers(cookie: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -176,7 +221,11 @@ impl Bilibili {
     }
 
     /// Get danmaku connection info with WBI signing.
-    async fn get_danmu_info(&self, room_id: u64, headers: &HeaderMap) -> Result<(String, String)> {
+    async fn get_danmu_info(
+        &self,
+        room_id: u64,
+        headers: &HeaderMap,
+    ) -> Result<(Vec<String>, String)> {
         // Build params
         let mut params = BTreeMap::new();
         params.insert("id".to_string(), room_id.to_string());
@@ -184,10 +233,14 @@ impl Bilibili {
         params.insert("web_location".to_string(), "444.8".to_string());
 
         // Sign with WBI
-        if let Err(e) = self.wbi_signer.sign(&mut params, headers).await {
-            debug!("WBI signing failed: {}, using default WebSocket URL", e);
-            return Ok((DEFAULT_WS_URL.to_string(), String::new()));
-        }
+        self.wbi_signer
+            .sign(&mut params, headers)
+            .await
+            .map_err(|_| {
+                DanmakuError::Decode(
+                    "WBI signing failed; refusing empty-token authentication".into(),
+                )
+            })?;
 
         // Build URL with signed params
         let query_string: String = params
@@ -211,6 +264,7 @@ impl Bilibili {
             .timeout(Duration::from_secs(5))
             .send()
             .await?
+            .error_for_status()?
             .text()
             .await?;
 
@@ -218,18 +272,15 @@ impl Bilibili {
         let json: Value = serde_json::from_str(&response)
             .map_err(|e| DanmakuError::Decode(format!("Invalid JSON: {}", e)))?;
 
-        // Check if API returned an error
+        Self::parse_danmu_info(&json)
+    }
+
+    fn parse_danmu_info(json: &Value) -> Result<(Vec<String>, String)> {
         let code = json.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
         if code != 0 {
-            let msg = json
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            debug!(
-                "getDanmuInfo returned error code {}: {}, using default WebSocket URL",
-                code, msg
-            );
-            return Ok((DEFAULT_WS_URL.to_string(), String::new()));
+            return Err(DanmakuError::Decode(format!(
+                "getDanmuInfo rejected (code={code}); no authentication attempted"
+            )));
         }
 
         // Parse successful response
@@ -243,19 +294,47 @@ impl Bilibili {
             .unwrap_or("")
             .to_string();
 
-        let ws_url = data
+        if token.is_empty() {
+            return Err(DanmakuError::Decode(
+                "getDanmuInfo returned an empty token".into(),
+            ));
+        }
+        let mut urls = Vec::new();
+        for host in data
             .get("host_list")
             .and_then(|v| v.as_array())
-            .and_then(|list| list.first())
-            .and_then(|host| {
-                let h = host.get("host")?.as_str()?;
-                let p = host.get("wss_port")?.as_u64()?;
-                Some(format!("wss://{}:{}/sub", h, p))
-            })
-            .unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-
-        debug!("Got token and WebSocket URL: {}", ws_url);
-        Ok((ws_url, token))
+            .into_iter()
+            .flatten()
+        {
+            let Some(h) = host.get("host").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(p) = host.get("wss_port").and_then(Value::as_u64) else {
+                continue;
+            };
+            if h.is_empty()
+                || !h
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'-')
+                || !(1..=65535).contains(&p)
+            {
+                continue;
+            }
+            let url = format!("wss://{h}:{p}/sub");
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        if urls.is_empty() {
+            return Err(DanmakuError::Decode(
+                "getDanmuInfo returned no valid WSS nodes".into(),
+            ));
+        }
+        debug!(
+            nodes = urls.len(),
+            "Bilibili connection information ready (token redacted)"
+        );
+        Ok((urls, token))
     }
 
     /// Build authentication packet.
@@ -284,14 +363,14 @@ impl Bilibili {
 
         while offset + 16 <= data.len() {
             let packet_len = BigEndian::read_u32(&data[offset..offset + 4]) as usize;
-            let _header_len = BigEndian::read_u16(&data[offset + 4..offset + 6]);
+            let header_len = BigEndian::read_u16(&data[offset + 4..offset + 6]) as usize;
             let version = BigEndian::read_u16(&data[offset + 6..offset + 8]);
             let operation = BigEndian::read_u32(&data[offset + 8..offset + 12]);
             let _sequence = BigEndian::read_u32(&data[offset + 12..offset + 16]);
 
             // 声明长度必须至少覆盖 16 字节包头，否则该帧不可信：
             // packet_len < 16 时反向切片会 panic，packet_len == 0 还会死循环
-            if packet_len < 16 {
+            if packet_len < 16 || header_len < 16 || header_len > packet_len {
                 debug!(
                     "Malformed packet length {}, dropping remaining {} bytes",
                     packet_len,
@@ -304,11 +383,14 @@ impl Bilibili {
                 break;
             }
 
-            let body = &data[offset + 16..offset + packet_len];
+            let body = &data[offset + header_len..offset + packet_len];
 
             match version {
                 ver::ZLIB | ver::BROTLI if depth >= MAX_DECODE_DEPTH => {
-                    debug!("Packet nesting exceeds depth {}, dropping", MAX_DECODE_DEPTH);
+                    debug!(
+                        "Packet nesting exceeds depth {}, dropping",
+                        MAX_DECODE_DEPTH
+                    );
                 }
                 ver::ZLIB => {
                     // Zlib compressed
@@ -510,8 +592,13 @@ impl Platform for Bilibili {
         url: &str,
         context: &PlatformContext,
     ) -> Result<ConnectionInfo> {
-        let uid = context.uid.unwrap_or(0);
+        let uid = Self::auth_uid(context)?;
         let cookie = context.cookie.as_deref();
+        debug!(
+            cookie_present = cookie.is_some(),
+            account_identity = uid != 0,
+            "Bilibili authentication identity selected (UID redacted)"
+        );
         let headers = Self::default_headers(cookie);
 
         // Get room ID
@@ -524,14 +611,17 @@ impl Platform for Bilibili {
         };
 
         // Get danmaku info
-        let (ws_url, token) = self.get_danmu_info(room_id, &headers).await?;
+        let (urls, token) = self.get_danmu_info(room_id, &headers).await?;
 
         // Build auth packet
         let auth_packet = Self::build_auth_packet(uid, room_id, &token);
 
-        Ok(ConnectionInfo::new(ws_url)
+        let mut info = ConnectionInfo::new(urls[0].clone())
+            .with_fallback_ws_urls(urls[1..].to_vec())
             .with_registration(vec![RegistrationData::Binary(auth_packet)])
-            .with_headers(headers))
+            .with_headers(headers);
+        info.auth_timeout = Some(Duration::from_secs(10));
+        Ok(info)
     }
 
     fn heartbeat_config(&self) -> HeartbeatConfig {
@@ -541,6 +631,10 @@ impl Platform for Bilibili {
     fn decode_message(&self, msg: &[u8]) -> Result<DecodeResult> {
         let packets = Self::decode_packet(msg);
         let mut events = Vec::new();
+        let mut result = DecodeResult {
+            packet_count: packets.len(),
+            ..DecodeResult::default()
+        };
 
         for packet in packets {
             match packet.operation {
@@ -550,11 +644,16 @@ impl Platform for Bilibili {
                     }
                 }
                 op::HEARTBEAT_REPLY => {
-                    // Heartbeat reply contains popularity count (4 bytes big-endian)
-                    // We ignore it for now
+                    result.heartbeat_replies += 1;
+                    debug!("Bilibili heartbeat response received");
                 }
                 op::AUTH_REPLY => {
-                    debug!("Auth reply received");
+                    let reply: Value = serde_json::from_slice(&packet.body)?;
+                    let code = reply.get("code").and_then(Value::as_i64).ok_or_else(|| {
+                        DanmakuError::Decode("Bilibili auth response missing numeric code".into())
+                    })?;
+                    debug!(code, "Bilibili authentication response received");
+                    result.auth_code = Some(code);
                 }
                 _ => {
                     debug!("Unknown operation: {}", packet.operation);
@@ -562,7 +661,8 @@ impl Platform for Bilibili {
             }
         }
 
-        Ok(DecodeResult::with_events(events))
+        result.events = events;
+        Ok(result)
     }
 }
 
